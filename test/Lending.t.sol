@@ -86,6 +86,12 @@ contract LendingTest is Test {
         uint256 amount
     );
 
+    event Repay(
+        address indexed user,
+        address indexed asset,
+        uint256 amount
+    );
+
     function setUp() public {
         vm.prank(owner);
         lending = new Lending(owner);
@@ -115,10 +121,11 @@ contract LendingTest is Test {
         vm.prank(owner);
         lending.configureToken(address(tokenA), factorBps, true);
 
-        (bool enabled, uint256 configuredFactorBps, address tokenAddr) = lending.config(address(tokenA));
+        (bool enabled, uint256 configuredFactorBps, address tokenAddr, uint256 annualRateBps) = lending.config(address(tokenA));
         assertTrue(enabled);
         assertEq(configuredFactorBps, factorBps);
         assertEq(tokenAddr, address(tokenA));
+        assertEq(annualRateBps, 1000);
     }
 
     function test_ConfigureToken_RevertWhen_InvalidCollateralFactor() public {
@@ -285,19 +292,16 @@ contract LendingTest is Test {
         lending.configureTokenPrice(address(tokenB), 1 * 1e18);
         vm.stopPrank();
 
+        tokenB.mint(address(lending), 10_000 * 1e18);
         tokenA.mint(user, 2 * 1e18);
+
         vm.startPrank(user);
         tokenA.approve(address(lending), 2 * 1e18);
         lending.depositCollateral(2 * 1e18, address(tokenA));
-        vm.stopPrank();
 
-        // Simulate debt: user owes 1,000 TokenB using stdstore
-        stdstore
-            .target(address(lending))
-            .sig("debtOwed(address,address)")
-            .with_key(user)
-            .with_key(address(tokenB))
-            .checked_write(1000 * 1e18);
+        // Borrow 1,000 TokenB
+        lending.borrow(address(tokenB), 1000 * 1e18);
+        vm.stopPrank();
 
         uint256 totalDebt = lending.getTotalDebtValue(user);
         assertEq(totalDebt, 1000 * 1e18);
@@ -528,4 +532,212 @@ contract LendingTest is Test {
             lending.checkBorrowCapacity(user, address(tokenB), borrowAmount);
         }
     }
+
+    /* -------------------------------------------------------------------------- */
+    /*                         INTEREST ACCRUAL TESTS                             */
+    /* -------------------------------------------------------------------------- */
+
+    function test_Alice_InterestAccrual_HalfYear() public {
+        address alice = makeAddr("alice");
+        uint256 borrowAmount = 1000 * 1e18; // 1,000 tokens
+        uint256 annualInterestRateBps = 1000; // 10% (1,000 BPS where 10,000 = 100%)
+        uint256 SECONDS_PER_YEAR = 365 days;
+        uint256 timeDenominator = 10_000 * SECONDS_PER_YEAR;
+
+        // Setup: Configure tokens and provide liquidity
+        vm.startPrank(owner);
+        lending.configureToken(address(tokenA), 7500, true);
+        lending.configureTokenPrice(address(tokenA), 2000 * 1e18);
+
+        lending.configureToken(address(tokenB), 8000, true);
+        lending.configureTokenPrice(address(tokenB), 1 * 1e18);
+        vm.stopPrank();
+
+        tokenB.mint(address(lending), 10_000 * 1e18);
+        tokenA.mint(alice, 2 * 1e18);
+
+        // Alice deposits collateral and borrows 1,000 tokens
+        vm.startPrank(alice);
+        tokenA.approve(address(lending), 2 * 1e18);
+        lending.depositCollateral(2 * 1e18, address(tokenA));
+        lending.borrow(address(tokenB), borrowAmount);
+        vm.stopPrank();
+
+        uint256 borrowTime = block.timestamp;
+
+        // 1. Immediately after borrowing (elapsed time = 0)
+        uint256 timeElapsedImmediate = block.timestamp - borrowTime;
+        uint256 immediateInterest = (borrowAmount * annualInterestRateBps * timeElapsedImmediate) / timeDenominator;
+        uint256 immediateDebt = borrowAmount + immediateInterest;
+
+        assertEq(immediateInterest, 0, "Immediate interest should be 0");
+        assertEq(immediateDebt, 1000 * 1e18, "Immediate debt should be 1,000 tokens");
+
+        // 2. Warp forward by half a year
+        uint256 halfYear = 365 days / 2; // 182.5 days (15,768,000 seconds)
+        vm.warp(block.timestamp + halfYear);
+
+        // 3. Calculate accrued interest after half a year
+        uint256 timeElapsed = block.timestamp - borrowTime;
+        uint256 accruedInterest = (borrowAmount * annualInterestRateBps * timeElapsed) / timeDenominator;
+        uint256 totalDebt = borrowAmount + accruedInterest;
+
+        // Expected interest: 1,000 * 10% * 0.5 = 50 tokens
+        // Expected total debt: 1,000 + 50 = 1,050 tokens
+        assertEq(accruedInterest, 50 * 1e18, "Accrued interest after 0.5 year should be 50 tokens");
+        assertEq(totalDebt, 1050 * 1e18, "Total debt after 0.5 year should be 1,050 tokens");
+    }
+
+    function test_Borrow_SubsequentBorrow_AccruesExistingInterestFirst() public {
+        // Alice borrows 1,000 tokens @ 10% annual interest
+        // After 0.5 years, interest = 50 tokens (total debt = 1,050)
+        // Alice then borrows 200 tokens
+        // New principal should be 1,050 + 200 = 1,250 tokens
+        address alice = makeAddr("alice");
+
+        vm.startPrank(owner);
+        lending.configureToken(address(tokenA), 7500, true);
+        lending.configureTokenPrice(address(tokenA), 2000 * 1e18);
+        lending.configureToken(address(tokenB), 8000, true);
+        lending.configureTokenPrice(address(tokenB), 1 * 1e18);
+        vm.stopPrank();
+
+        tokenB.mint(address(lending), 10_000 * 1e18);
+        tokenA.mint(alice, 2 * 1e18);
+
+        vm.startPrank(alice);
+        tokenA.approve(address(lending), 2 * 1e18);
+        lending.depositCollateral(2 * 1e18, address(tokenA));
+        lending.borrow(address(tokenB), 1000 * 1e18);
+        vm.stopPrank();
+
+        // Warp forward half a year (365 days / 2)
+        vm.warp(block.timestamp + 365 days / 2);
+
+        // Refresh oracle price after warp
+        vm.startPrank(owner);
+        lending.configureTokenPrice(address(tokenA), 2000 * 1e18);
+        lending.configureTokenPrice(address(tokenB), 1 * 1e18);
+        vm.stopPrank();
+
+        // Debt before 2nd borrow: 1,050 tokens
+        assertEq(lending.getAccruedDebt(alice, address(tokenB)), 1050 * 1e18);
+
+        // Alice borrows additional 200 tokens
+        vm.startPrank(alice);
+        lending.borrow(address(tokenB), 200 * 1e18);
+        vm.stopPrank();
+
+        // Principal should now be 1,250 tokens (1,050 compounded + 200 new borrow)
+        (uint256 principal, uint256 lastAccruedAt) = lending.debtPositions(alice, address(tokenB));
+        assertEq(principal, 1250 * 1e18);
+        assertEq(lastAccruedAt, block.timestamp);
+        assertEq(lending.getAccruedDebt(alice, address(tokenB)), 1250 * 1e18);
+    }
+
+    function test_Repay_Success_EmitsEvent() public {
+        address alice = makeAddr("alice");
+
+        vm.startPrank(owner);
+        lending.configureToken(address(tokenA), 7500, true);
+        lending.configureTokenPrice(address(tokenA), 2000 * 1e18);
+        lending.configureToken(address(tokenB), 8000, true);
+        lending.configureTokenPrice(address(tokenB), 1 * 1e18);
+        vm.stopPrank();
+
+        tokenB.mint(address(lending), 10_000 * 1e18);
+        tokenA.mint(alice, 2 * 1e18);
+
+        vm.startPrank(alice);
+        tokenA.approve(address(lending), 2 * 1e18);
+        lending.depositCollateral(2 * 1e18, address(tokenA));
+        lending.borrow(address(tokenB), 1000 * 1e18);
+
+        // Repay 400 tokens
+        tokenB.approve(address(lending), 400 * 1e18);
+        vm.expectEmit(true, true, false, true, address(lending));
+        emit Repay(alice, address(tokenB), 400 * 1e18);
+        lending.repay(address(tokenB), 400 * 1e18);
+        vm.stopPrank();
+
+        // Remaining debt should be 600 tokens
+        assertEq(lending.getAccruedDebt(alice, address(tokenB)), 600 * 1e18);
+    }
+
+    function test_Repay_WithAccruedInterest() public {
+        address alice = makeAddr("alice");
+
+        vm.startPrank(owner);
+        lending.configureToken(address(tokenA), 7500, true);
+        lending.configureTokenPrice(address(tokenA), 2000 * 1e18);
+        lending.configureToken(address(tokenB), 8000, true);
+        lending.configureTokenPrice(address(tokenB), 1 * 1e18);
+        vm.stopPrank();
+
+        tokenB.mint(address(lending), 10_000 * 1e18);
+        tokenA.mint(alice, 2 * 1e18);
+
+        vm.startPrank(alice);
+        tokenA.approve(address(lending), 2 * 1e18);
+        lending.depositCollateral(2 * 1e18, address(tokenA));
+        lending.borrow(address(tokenB), 1000 * 1e18);
+        vm.stopPrank();
+
+        // Half a year passes: debt grows to 1,050 tokens
+        vm.warp(block.timestamp + 365 days / 2);
+        assertEq(lending.getAccruedDebt(alice, address(tokenB)), 1050 * 1e18);
+
+        // Alice mints extra 50 tokens to repay full 1,050 debt
+        tokenB.mint(alice, 50 * 1e18);
+
+        vm.startPrank(alice);
+        tokenB.approve(address(lending), 1050 * 1e18);
+        lending.repay(address(tokenB), 1050 * 1e18);
+        vm.stopPrank();
+
+        // Debt is fully paid off
+        assertEq(lending.getAccruedDebt(alice, address(tokenB)), 0);
+        (uint256 principal, uint256 lastAccruedAt) = lending.debtPositions(alice, address(tokenB));
+        assertEq(principal, 0);
+        assertEq(lastAccruedAt, 0);
+    }
+
+    function test_BorrowCapacity_ShrinksAsInterestAccrues() public {
+        // Collateral: 2 TokenA ($4,000) -> Max Borrow Capacity = $3,000
+        // Borrow 2,000 TokenB ($2,000) -> Initial Remaining Capacity = $1,000
+        address alice = makeAddr("alice");
+
+        vm.startPrank(owner);
+        lending.configureToken(address(tokenA), 7500, true);
+        lending.configureTokenPrice(address(tokenA), 2000 * 1e18);
+        lending.configureToken(address(tokenB), 8000, true);
+        lending.configureTokenPrice(address(tokenB), 1 * 1e18);
+        vm.stopPrank();
+
+        tokenB.mint(address(lending), 10_000 * 1e18);
+        tokenA.mint(alice, 2 * 1e18);
+
+        vm.startPrank(alice);
+        tokenA.approve(address(lending), 2 * 1e18);
+        lending.depositCollateral(2 * 1e18, address(tokenA));
+        lending.borrow(address(tokenB), 2000 * 1e18);
+        vm.stopPrank();
+
+        assertEq(lending.getRemainingBorrowCapacity(alice), 1000 * 1e18);
+
+        // Warp 1 full year -> 10% interest on 2,000 = 200 tokens
+        // Total Debt becomes 2,200 tokens
+        // Remaining Capacity becomes $3,000 - $2,200 = $800
+        vm.warp(block.timestamp + 365 days);
+
+        // Refresh oracle prices after 1 year warp
+        vm.startPrank(owner);
+        lending.configureTokenPrice(address(tokenA), 2000 * 1e18);
+        lending.configureTokenPrice(address(tokenB), 1 * 1e18);
+        vm.stopPrank();
+
+        assertEq(lending.getTotalDebtValue(alice), 2200 * 1e18);
+        assertEq(lending.getRemainingBorrowCapacity(alice), 800 * 1e18);
+    }
 }
+
